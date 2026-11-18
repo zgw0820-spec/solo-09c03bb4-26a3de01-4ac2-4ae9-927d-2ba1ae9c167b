@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS ops (
   seq              INTEGER PRIMARY KEY,
   version_id       INTEGER NOT NULL,    -- 目标版本
   base_version_id  INTEGER NOT NULL,    -- 提交时页面所见的在用版本
-  state            TEXT NOT NULL,       -- activating|pending_verify|succeeded|failed|superseded
+  state            TEXT NOT NULL,       -- activating|pending_verify|rollback_pending|succeeded|failed|superseded
   detail           TEXT,
   created_at       TEXT NOT NULL,
   updated_at       TEXT NOT NULL

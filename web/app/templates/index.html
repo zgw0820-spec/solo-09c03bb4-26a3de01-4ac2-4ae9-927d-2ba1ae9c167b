@@ -41,6 +41,8 @@
   <p>启用状态：
     {% if st.latest_op and st.latest_op.state == 'activating' %}
       <span class="warn">启用进行中（操作 #{{ st.latest_op.seq }}）…</span>
+    {% elif st.latest_op and st.latest_op.state == 'rollback_pending' %}
+      <span class="bad">回退待核实（操作 #{{ st.latest_op.seq }}）：{{ st.latest_op.detail }}。重启后仍会继续核对，确认前禁止下一笔启用</span>
     {% elif st.latest_op and st.latest_op.state == 'pending_verify' %}
       <span class="warn">待核实（操作 #{{ st.latest_op.seq }}）：{{ st.latest_op.detail }}</span>
     {% elif st.consistency == 'match' %}
@@ -51,6 +53,10 @@
       <span class="warn">待核实 —— 实测指纹与在用版本不一致，系统将自动恢复</span>
     {% endif %}
   </p>
+  {% if st.activation_blocked and st.activation_blocked.state == 'rollback_pending' %}
+  <p class="bad">⛔ 操作 #{{ st.activation_blocked.seq }} 的回退尚未经新建 TLS 握手确认，
+     所有启用按钮已锁定，避免未完成的回退覆盖新结果。页面将在状态确认后自动恢复。</p>
+  {% endif %}
   {% if st.latest_op %}
   <p class="muted">最近操作 #{{ st.latest_op.seq }}：目标版本 #{{ st.latest_op.version_id }}，
      状态 {{ st.latest_op.state }}，{{ st.latest_op.updated_at }}
@@ -73,7 +79,12 @@
         <input type="hidden" name="version_id" value="{{ v.id }}">
         <input type="hidden" name="base_version_id" value="{{ st.active_version_id }}">
         <input type="hidden" name="redirect" value="1">
-        <button type="submit">启用（基于在用版号 #{{ st.active_version_id }}）</button>
+        <button type="submit"
+          {% if st.activation_blocked %}disabled
+            title="{% if st.activation_blocked.state == 'rollback_pending' %}回退待核实，确认前禁止启用{% else %}有操作进行中{% endif %}"
+          {% endif %}>
+          启用（基于在用版号 #{{ st.active_version_id }}）
+        </button>
       </form>
       {% else %}—{% endif %}
     </td>

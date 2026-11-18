@@ -48,6 +48,8 @@ start_nginx() {
   write_nginx_conf
   RELOAD_DIR="$WORK/reload" LIVE_DIR="$WORK/live" NGINX_BIN="$NGINX_BIN" \
     NGINX_ARGS="-p $NGX -c $NGX/nginx.conf" \
+    REAL_NGINX_BIN="${REAL_NGINX_BIN:-}" NGINX_HOLD="${NGINX_HOLD:-}" \
+    NGINX_HOLD_QUEUE="${NGINX_HOLD_QUEUE:-}" \
     nohup sh "$ROOT/nginx/reload-watcher.sh" > "$WORK/watcher.log" 2>&1 &
   echo $! > "$RUN/watcher.pid"
 }
@@ -56,7 +58,10 @@ start_web() {
   SITE_DOMAIN=demo.internal \
   DATA_DIR="$WORK/data" LIVE_DIR="$WORK/live" RELOAD_DIR="$WORK/reload" \
   NGINX_PROBE_HOST=127.0.0.1 NGINX_PROBE_PORT="$TLS_PORT" \
-  RECEIPT_TIMEOUT=6 VERIFY_TIMEOUT=10 PENDING_TTL=20 STARTUP_PROBE_TIMEOUT=20 \
+  RECEIPT_TIMEOUT="${RECEIPT_TIMEOUT:-6}" VERIFY_TIMEOUT="${VERIFY_TIMEOUT:-10}" \
+  PENDING_TTL="${PENDING_TTL:-20}" STARTUP_PROBE_TIMEOUT="${STARTUP_PROBE_TIMEOUT:-20}" \
+  ROLLBACK_CONFIRM_TIMEOUT="${ROLLBACK_CONFIRM_TIMEOUT:-6}" \
+  ROLLBACK_RETRY_INTERVAL="${ROLLBACK_RETRY_INTERVAL:-5}" \
   ACTIVATE_DELAY_AFTER_WRITE="$DELAY" \
   nohup python3 -m uvicorn app.main:app --app-dir "$ROOT/web" \
     --host 127.0.0.1 --port "$WEB_PORT" > "$WORK/web.log" 2>&1 &
@@ -92,9 +97,20 @@ case "${1:-}" in
     ;;
   down)
     for p in watcher web; do
-      [ -f "$RUN/$p.pid" ] && kill "$(cat "$RUN/$p.pid")" 2>/dev/null || true
+      if [ -f "$RUN/$p.pid" ]; then
+        kill -CONT "$(cat "$RUN/$p.pid")" 2>/dev/null || true
+        kill "$(cat "$RUN/$p.pid")" 2>/dev/null || true
+      fi
     done
-    [ -f "$RUN/nginx.pid" ] && kill "$(cat "$RUN/nginx.pid")" 2>/dev/null || true
+    [ -f "$RUN/nginx.pid" ] && { kill -CONT "$(cat "$RUN/nginx.pid")" 2>/dev/null || true
+      kill "$(cat "$RUN/nginx.pid")" 2>/dev/null || true; }
+    # 兜底：清理可能被 SIGSTOP 挂住的遗留进程（先 CONT 再 KILL）
+    for np in $(pgrep -f "$NGX/nginx.conf" 2>/dev/null || true); do
+      kill -CONT "$np" 2>/dev/null || true; kill -9 "$np" 2>/dev/null || true
+    done
+    for wp in $(pgrep -f "uvicorn app.main:app.*$ROOT/web" 2>/dev/null || true); do
+      kill -CONT "$wp" 2>/dev/null || true; kill -9 "$wp" 2>/dev/null || true
+    done
     sleep 0.5
     echo "DOWN"
     ;;

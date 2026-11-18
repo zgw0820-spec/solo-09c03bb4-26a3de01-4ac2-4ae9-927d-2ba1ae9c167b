@@ -104,10 +104,18 @@ def activate(
     state_msg = {
         "succeeded": f"启用成功：版本 #{op['version_id']} 已在用，新 TLS 连接已核实",
         "pending_verify": "已提交，但回执不明/暂无法核实，状态待核实，系统会自动跟进",
+        "rollback_pending": (
+            f"启用未确认且回退待核实：版本 #{op['version_id']} 的最终结果须以新建 "
+            "TLS 握手为准，系统重启后仍会继续核对；确认前禁止下一笔启用"
+        ),
         "failed": f"启用失败：{op.get('detail') or ''}",
     }
     msg = state_msg.get(op["state"], f"操作状态：{op['state']}")
-    code = 200 if op["state"] == "succeeded" else (202 if op["state"] == "pending_verify" else 500)
+    code = (
+        200 if op["state"] == "succeeded"
+        else 500 if op["state"] == "failed"
+        else 202
+    )
     return _respond(
         request, redirect, {"msg": msg, "op": op}, code if not redirect else 200
     )

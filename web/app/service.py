@@ -4,8 +4,12 @@
 - 启用请求带"页面所见版号"(base_version_id)，在 BEGIN IMMEDIATE 事务内
   比较-交换，过期提交与并发重复提交直接拒绝，不会覆盖在用证书。
 - 启用成功以"Nginx 新建 TLS 连接返回新证书指纹"为唯一判据；
-  重载回执失败 -> 回滚文件并保持旧版本在用；
-  回执不明/无法探测 -> 置"待核实"，由后台核实循环继续处理。
+  重载回执 ok 但握手仍是旧证书时不提前判失败——重载可能迟到生效，
+  操作置"待核实"由后台循环继续核实，迟到生效后据实确认成功。
+- 回退（回滚）同样以新建 TLS 握手为唯一判据：文件恢复 + 重载回执
+  不足以证明旧版恢复；握手确认旧证书仍在用才判失败，
+  确认不了置"回退待核实"(rollback_pending)，重启后继续核对。
+- 回退待核实期间拒绝下一笔启用，避免未完成的回退覆盖新结果。
 - 任何落库/写文件动作前都检查"自己是否仍是最新操作"，
   旧操作不得覆盖后来提交。
 - 进程重启时按 Nginx 实际服务的指纹对账，恢复到可确认的在用版本。
@@ -61,10 +65,12 @@ class Config:
     probe_port: int = 443
     receipt_timeout: float = 6.0      # 等待重载回执的秒数
     verify_timeout: float = 10.0      # 启用后探测新证书的秒数
-    pending_ttl: float = 45.0         # 待核实操作的宽限秒数，超时回退
+    pending_ttl: float = 45.0         # 待核实操作的宽限秒数，超时发起回退
     probe_interval: float = 0.5
     startup_probe_timeout: float = 15.0
     restore_interval: float = 30.0    # 无在途操作时一致性修复的最小间隔
+    rollback_confirm_timeout: float = 6.0   # 回退后等握手确认的秒数
+    rollback_retry_interval: float = 5.0    # 回退待核实期间重试重载的最小间隔
     activate_delay_after_write: float = 0.0  # 测试钩子：写完文件后人为延迟
 
     @property
@@ -85,6 +91,8 @@ class Config:
             verify_timeout=float(e.get("VERIFY_TIMEOUT", "10")),
             pending_ttl=float(e.get("PENDING_TTL", "45")),
             startup_probe_timeout=float(e.get("STARTUP_PROBE_TIMEOUT", "15")),
+            rollback_confirm_timeout=float(e.get("ROLLBACK_CONFIRM_TIMEOUT", "6")),
+            rollback_retry_interval=float(e.get("ROLLBACK_RETRY_INTERVAL", "5")),
             activate_delay_after_write=float(e.get("ACTIVATE_DELAY_AFTER_WRITE", "0")),
         )
 
@@ -163,6 +171,7 @@ class CertService:
         self._thread: threading.Thread | None = None
         self._probe_cache: tuple[float, str | None] = (0.0, None)
         self._last_restore = 0.0
+        self._last_rollback_retry = 0.0
 
     # ------------------------------------------------------------ 生命周期
 
@@ -184,16 +193,23 @@ class CertService:
         with self.db.txn() as c:
             op = self._latest_inflight(c)
         if op:
-            target = self._version(op["version_id"])
-            if served is not None and served == target["fingerprint"]:
-                self._finalize_success(op["seq"], note="重启后核实：新证书已生效")
-            elif served is not None:
-                self._recover_to_confirmable(served)
-                self._finalize_fail(
-                    op["seq"], "进程重启，启用结果未确认，已恢复到可确认的在用版本"
-                )
+            if op["state"] == "rollback_pending":
+                # 重启只重新断言一次回退（写回在用版本 + 触发重载），不凭单次
+                # 探测结案：迟到重载可能在启动瞬间才落地，终态交给后台
+                # 核实循环的"新建 TLS 握手"给出。
+                self._resume_rollback_pending(op)
             else:
-                log.warning("startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"])
+                target = self._version(op["version_id"])
+                if served is not None and served == target["fingerprint"]:
+                    self._finalize_success(op["seq"], note="重启后核实：新证书已生效")
+                elif served is not None:
+                    self._recover_to_confirmable(served)
+                    self._finalize_fail(
+                        op["seq"],
+                        "进程重启，启用结果未确认，回退后经新建 TLS 握手确认旧证书在用",
+                    )
+                else:
+                    log.warning("startup: 无法探测 Nginx，操作 #%s 保持待核实", op["seq"])
         else:
             self._ensure_live_matches_active(served)
         if background:
@@ -275,11 +291,20 @@ class CertService:
                     f"页面版号已过期（当前在用版本 #{st['active_version_id']}），"
                     "请刷新后重试"
                 )
-            inflight = c.execute(
-                "SELECT seq FROM ops WHERE state='activating'"
+            blocked = c.execute(
+                "SELECT seq, state FROM ops"
+                " WHERE state IN ('activating','rollback_pending')"
+                " ORDER BY seq DESC LIMIT 1"
             ).fetchone()
-            if inflight:
-                raise Conflict(f"另一启用操作 (#{inflight['seq']}) 正在进行，请稍后")
+            if blocked:
+                if blocked["state"] == "rollback_pending":
+                    raise Conflict(
+                        f"上一笔操作 (#{blocked['seq']}) 的回退仍待核实，"
+                        "请等系统确认旧证书恢复后再启用，避免未完成的回退覆盖新结果"
+                    )
+                raise Conflict(
+                    f"另一启用操作 (#{blocked['seq']}) 正在进行，请稍后"
+                )
             v = c.execute("SELECT * FROM versions WHERE id=?", (version_id,)).fetchone()
             if not v:
                 raise NotFound(f"版本 #{version_id} 不存在")
@@ -321,7 +346,9 @@ class CertService:
         token = f"{seq}-{uuid.uuid4().hex[:8]}"
         self.control.request_reload(token)
         receipt = self.control.wait_receipt(token, self.cfg.receipt_timeout)
-        # 3. 以新建 TLS 连接的实际握手结果为准
+        # 3. 以新建 TLS 连接的实际握手结果为准。
+        #    即使回执已返回 ok，也可能重载迟到生效（握手暂时仍是旧证书），
+        #    因此整个核实窗口内持续探测，不凭回执提前判失败。
         served = None
         deadline = time.monotonic() + self.cfg.verify_timeout
         while time.monotonic() < deadline:
@@ -331,24 +358,52 @@ class CertService:
                 served = None
             if served == target["fingerprint"]:
                 break
-            if receipt is not None and receipt.startswith("fail"):
-                break
             time.sleep(self.cfg.probe_interval)
         # 4. 判定
         if served == target["fingerprint"]:
             self._finalize_success(seq, note="新 TLS 连接已返回新证书")
             return
-        if receipt is not None and receipt.startswith("fail"):
-            self._rollback_files(base)
-            self._finalize_fail(seq, f"Nginx 重载失败（{receipt}），已沿用旧证书")
+        # 握手未确认新证书：无论回执 ok/fail/超时，先回退文件并尝试回退重载。
+        # 回退是否成立同样只能由"新建 TLS 握手 == 旧证书"确认。
+        reason = self._activation_miss_reason(receipt, served)
+        self._request_rollback(seq, base)
+        if self._confirm_rollback(base["fingerprint"], self.cfg.rollback_confirm_timeout):
+            self._finalize_fail(
+                seq, f"{reason}；已回退，且新建 TLS 握手确认旧证书仍在用"
+            )
             return
-        if receipt == "ok" and served is not None:
-            self._rollback_files(base)
-            self._finalize_fail(seq, "重载后新连接仍返回旧证书，已回退并保持旧证书在用")
-            return
-        # 回执不明或无法探测 -> 待核实
-        reason = "重载回执超时" if receipt is None else "无法建立新连接核实"
-        self._mark_pending(seq, f"{reason}，待核实")
+        # 回退未经握手确认（回执失败/超时、或握手仍是新证书——可能迟到生效）
+        self._mark_rollback_pending(seq, f"{reason}；回退已发起但未经新握手确认，待核实")
+
+    @staticmethod
+    def _activation_miss_reason(receipt: str | None, served: str | None) -> str:
+        if receipt is None:
+            return "重载回执超时"
+        if receipt.startswith("fail"):
+            return f"Nginx 重载失败（{receipt}）"
+        if served is None:
+            return "重载后无法建立新连接核实"
+        return "重载后新连接仍返回旧证书（可能延迟生效）"
+
+    def _request_rollback(self, seq: int, base: dict) -> str:
+        """把 live 文件恢复为旧版本并触发一次回退重载，返回回执（可能为 None）。"""
+        self._write_live(base)
+        token = f"rollback-{seq}-{uuid.uuid4().hex[:8]}"
+        self.control.request_reload(token)
+        return self.control.wait_receipt(token, self.cfg.receipt_timeout) or ""
+
+    def _confirm_rollback(self, expected_fp: str, timeout: float) -> bool:
+        """在 timeout 窗口内反复新建 TLS 连接；握手指纹与留存旧证书一致才确认。"""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            try:
+                served = self.control.probe()
+            except ProbeError:
+                served = None
+            if served == expected_fp:
+                return True
+            time.sleep(min(self.cfg.probe_interval, timeout))
+        return False
 
     # ------------------------------------------------------------ 终态落库
 
@@ -358,7 +413,9 @@ class CertService:
     def _finalize_success(self, seq: int, note: str = "") -> None:
         with self.db.txn() as c:
             op = self._op(c, seq)
-            if not op or op["state"] not in ("activating", "pending_verify"):
+            if not op or op["state"] not in (
+                "activating", "pending_verify", "rollback_pending"
+            ):
                 return
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
             if st["current_op_seq"] != seq:
@@ -384,7 +441,9 @@ class CertService:
     def _finalize_fail(self, seq: int, reason: str) -> None:
         with self.db.txn() as c:
             op = self._op(c, seq)
-            if not op or op["state"] not in ("activating", "pending_verify"):
+            if not op or op["state"] not in (
+                "activating", "pending_verify", "rollback_pending"
+            ):
                 return
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
             if st["current_op_seq"] != seq:
@@ -423,6 +482,27 @@ class CertService:
                 (detail, now_iso(), seq),
             )
 
+    def _mark_rollback_pending(self, seq: int, detail: str) -> None:
+        """回退已发起但未经新握手确认：置回退待核实，禁止下一笔启用。"""
+        with self.db.txn() as c:
+            op = self._op(c, seq)
+            if not op or op["state"] not in ("activating", "pending_verify"):
+                return
+            st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
+            if st["current_op_seq"] != seq:
+                c.execute(
+                    "UPDATE ops SET state='superseded', detail=?, updated_at=?"
+                    " WHERE seq=?",
+                    ("已有更新的操作，本操作结果作废", now_iso(), seq),
+                )
+                return
+            c.execute(
+                "UPDATE ops SET state='rollback_pending', detail=?, updated_at=?"
+                " WHERE seq=?",
+                (detail, now_iso(), seq),
+            )
+        self._invalidate_probe()
+
     # ------------------------------------------------------------ 后台核实
 
     def _reconcile_loop(self) -> None:
@@ -439,11 +519,18 @@ class CertService:
             ).fetchone()["n"]
             if activating:
                 return  # 前台请求线程 owns 启用中的操作
+            rollback_op = c.execute(
+                "SELECT * FROM ops WHERE state='rollback_pending'"
+                " ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
             op = c.execute(
                 "SELECT * FROM ops WHERE state='pending_verify'"
                 " ORDER BY seq DESC LIMIT 1"
             ).fetchone()
             st = c.execute("SELECT * FROM state WHERE id=1").fetchone()
+        if rollback_op:
+            self._handle_rollback_pending(rollback_op, st)
+            return
         if op:
             if st["current_op_seq"] != op["seq"]:
                 with self.db.txn() as c:
@@ -464,11 +551,21 @@ class CertService:
             created = dt.datetime.fromisoformat(op["created_at"])
             age = (dt.datetime.now(UTC) - created).total_seconds()
             if age > self.cfg.pending_ttl:
+                # 宽限期满仍未确认新证书：发起回退。回退结果仍须握手确认，
+                # 确认不了转入"回退待核实"并继续核对，绝不凭回执结案。
                 active = self._version(st["active_version_id"])
-                self._rollback_files(active)
-                self._finalize_fail(
-                    op["seq"], "超过待核实时限仍未生效，已回退到可确认的在用版本"
-                )
+                self._request_rollback(op["seq"], active)
+                if self._confirm_rollback(
+                    active["fingerprint"], self.cfg.rollback_confirm_timeout
+                ):
+                    self._finalize_fail(
+                        op["seq"],
+                        "超过待核实时限仍未生效；已回退，且新建 TLS 握手确认旧证书在用",
+                    )
+                else:
+                    self._mark_rollback_pending(
+                        op["seq"], "回退已发起但未经新握手确认，待核实"
+                    )
             return
         # 无在途操作：保持"文件/实测/在用"三者一致（限流）
         if time.monotonic() - self._last_restore < self.cfg.restore_interval:
@@ -481,6 +578,72 @@ class CertService:
         if active and served != active["fingerprint"]:
             self._last_restore = time.monotonic()
             self._ensure_live_matches_active(served)
+
+    def _handle_rollback_pending(self, op: dict, st) -> None:
+        """回退待核实：重启/后台继续核对，直到新握手确认结果为止。"""
+        if st["current_op_seq"] != op["seq"]:
+            with self.db.txn() as c:
+                c.execute(
+                    "UPDATE ops SET state='superseded', detail=?, updated_at=?"
+                    " WHERE seq=?",
+                    ("已有更新的操作，本操作结果作废", now_iso(), op["seq"]),
+                )
+            return
+        target = self._version(op["version_id"])
+        base = self._version(st["active_version_id"])
+        try:
+            served = self.control.probe()
+        except ProbeError:
+            # 无法握手 = 无法确认：保持回退待核实。只请求一次（节流的）重载，
+            # 绝不重写 live 文件——在无法证伪之前，覆盖磁盘证书可能抹掉
+            # 已经迟到生效的新结果。
+            self._retry_rollback_reload(base, rewrite=False)
+            return
+        if served == target["fingerprint"]:
+            # 新证书迟到生效：据实确认启用成功（即使回退重载曾失败）
+            self._finalize_success(op["seq"], note="后台核实：新证书迟到生效")
+            return
+        if served == base["fingerprint"]:
+            # 新建 TLS 握手与最终留存的旧证书一致：回退确认，结案
+            self._finalize_fail(
+                op["seq"], "回退后经新建 TLS 握手确认旧证书仍在用，启用失败结案"
+            )
+            return
+        # 握手结果既不是新证书也不是在用旧证书：重新断言回退（节流）
+        self._retry_rollback_reload(base, rewrite=True)
+
+    def _retry_rollback_reload(self, base: dict | None, rewrite: bool) -> None:
+        """回退待核实期间按节流重试。
+
+        rewrite=True（握手得到第三种不明指纹）：重写 live 为旧版本并请求重载；
+        rewrite=False（无法握手）：仅请求重载，不改动 live，避免抹掉迟到生效的结果。
+        """
+        if not base:
+            return
+        if time.monotonic() - self._last_rollback_retry < self.cfg.rollback_retry_interval:
+            return
+        self._last_rollback_retry = time.monotonic()
+        if rewrite:
+            self._write_live(base)
+        self.control.request_reload(f"rollback-retry-{uuid.uuid4().hex[:8]}")
+        self._invalidate_probe()
+
+    def _resume_rollback_pending(self, op: dict) -> None:
+        """进程重启后恢复回退待核实操作：先按在用版本断言一次回退重载。
+
+        只断言一次且不凭单次探测结案；若重载迟到使新证书随后生效，
+        后台核实循环的新建握手会据实确认成功。
+        """
+        with self.db.txn() as c:
+            active = c.execute(
+                "SELECT v.* FROM state s JOIN versions v"
+                " ON v.id=s.active_version_id WHERE s.id=1"
+            ).fetchone()
+        if active:
+            self._write_live(dict(active))
+            self.control.request_reload(f"rollback-resume-{uuid.uuid4().hex[:8]}")
+            self._invalidate_probe()
+        self._last_rollback_retry = time.monotonic()
 
     # ------------------------------------------------------------ 恢复辅助
 
@@ -524,12 +687,6 @@ class CertService:
             log.warning("Nginx 服务指纹与在用版本不一致，重新触发重载")
             self.control.request_reload(f"restore-{uuid.uuid4().hex[:8]}")
 
-    def _rollback_files(self, version: dict) -> None:
-        self._write_live(version)
-        token = f"rollback-{uuid.uuid4().hex[:8]}"
-        self.control.request_reload(token)
-        self.control.wait_receipt(token, 3.0)  # 尽力而为
-
     # ------------------------------------------------------------ 查询
 
     def get_op(self, seq: int) -> dict:
@@ -555,6 +712,11 @@ class CertService:
                     "SELECT * FROM ops ORDER BY seq DESC LIMIT 10"
                 ).fetchall()
             ]
+            blocker = c.execute(
+                "SELECT seq, state, detail FROM ops"
+                " WHERE state IN ('activating','rollback_pending')"
+                " ORDER BY seq DESC LIMIT 1"
+            ).fetchone()
         active = next(
             (v for v in versions if v["id"] == st["active_version_id"]), None
         )
@@ -571,6 +733,7 @@ class CertService:
             "consistency": consistency,
             "active_version_id": st["active_version_id"],
             "current_op_seq": st["current_op_seq"],
+            "activation_blocked": dict(blocker) if blocker else None,
             "active": active,
             "versions": versions,
             "ops": ops,
@@ -611,7 +774,8 @@ class CertService:
     @staticmethod
     def _latest_inflight(c):
         return c.execute(
-            "SELECT * FROM ops WHERE state IN ('activating','pending_verify')"
+            "SELECT * FROM ops WHERE state IN "
+            "('activating','pending_verify','rollback_pending')"
             " ORDER BY seq DESC LIMIT 1"
         ).fetchone()
 
